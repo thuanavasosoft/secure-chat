@@ -10,6 +10,11 @@ export default defineConfig({
     }
   },
   server: {
+    host: "securechat.hr247.tech",
+    port: 5173
+  },
+  preview: {
+    host: "securechat.hr247.tech",
     port: 5173
   }
 });
