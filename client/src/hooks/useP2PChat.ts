@@ -19,6 +19,11 @@ type UiMessage = {
   attachment: AttachmentMeta | null;
 };
 
+type PartnerLastMessage = {
+  text: string;
+  sentAt: string;
+};
+
 type ConnectionStatus = "idle" | "signaling" | "connecting" | "open" | "closed" | "error";
 
 export const useP2PChat = (currentUser: User) => {
@@ -34,6 +39,15 @@ export const useP2PChat = (currentUser: User) => {
   const [signalStatus, setSignalStatus] = useState<"connecting" | "open" | "closed" | "error">("closed");
   const [iceState, setIceState] = useState<RTCPeerConnectionState>("new");
   const [error, setError] = useState<string | null>(null);
+  const [partnerLastMessageById, setPartnerLastMessageById] = useState<Record<number, PartnerLastMessage>>({});
+
+  const makePreviewText = useCallback((message: { body: string; attachment: AttachmentMeta | null }): string => {
+    if (message.attachment) {
+      return `Tệp đính kèm: ${message.attachment.originalName}`;
+    }
+    const normalized = message.body.replace(/\s+/g, " ").trim();
+    return normalized.length > 0 ? normalized : "Tin nhắn trống";
+  }, []);
 
   const setupPeer = useCallback(
     (partner: User) => {
@@ -56,17 +70,25 @@ export const useP2PChat = (currentUser: User) => {
           }
         },
         onMessage: (text) => {
+          const sentAt = new Date().toISOString();
           setMessages((prev) => [
             ...prev,
             {
               id: `in-${Date.now()}-${Math.random()}`,
               senderId: partner.id,
               body: text,
-              sentAt: new Date().toISOString(),
+              sentAt,
               persisted: true,
               attachment: null
             }
           ]);
+          setPartnerLastMessageById((prev) => ({
+            ...prev,
+            [partner.id]: {
+              text: makePreviewText({ body: text, attachment: null }),
+              sentAt
+            }
+          }));
         },
         onChannelState: (dcState) => {
           if (dcState === "open") {
@@ -84,7 +106,7 @@ export const useP2PChat = (currentUser: User) => {
       peerRef.current = peer;
       return peer;
     },
-    [currentUser.id]
+    [currentUser.id, makePreviewText]
   );
 
   useEffect(() => {
@@ -195,17 +217,30 @@ export const useP2PChat = (currentUser: User) => {
 
   const loadHistory = useCallback(async (partner: User) => {
     const data = await getHistory(partner.id);
-    setMessages(
-      data.messages.map((m: ChatMessage) => ({
+    const mappedMessages = data.messages.map((m: ChatMessage) => ({
         id: `db-${m.id}`,
         senderId: m.senderId,
         body: m.body,
         sentAt: m.sentAt,
         persisted: true,
         attachment: m.attachment ?? null
-      }))
-    );
-  }, []);
+      }));
+    setMessages(mappedMessages);
+
+    const latestMessage = mappedMessages[mappedMessages.length - 1];
+    setPartnerLastMessageById((prev) => {
+      if (!latestMessage) {
+        return prev;
+      }
+      return {
+        ...prev,
+        [partner.id]: {
+          text: makePreviewText({ body: latestMessage.body, attachment: latestMessage.attachment }),
+          sentAt: latestMessage.sentAt
+        }
+      };
+    });
+  }, [makePreviewText]);
 
   const selectPartner = useCallback(
     async (partner: User) => {
@@ -300,6 +335,13 @@ export const useP2PChat = (currentUser: User) => {
           attachment: null
         }
       ]);
+      setPartnerLastMessageById((prev) => ({
+        ...prev,
+        [selectedPartner.id]: {
+          text: makePreviewText({ body, attachment: null }),
+          sentAt
+        }
+      }));
 
       const persisted = await persistOutgoingMessage(selectedPartner.id, body, sentAt);
       setMessages((prev) =>
@@ -325,7 +367,7 @@ export const useP2PChat = (currentUser: User) => {
         }
       }
     },
-    [currentUser.id, selectedPartner, status]
+    [currentUser.id, makePreviewText, selectedPartner, status]
   );
 
   const sendAttachment = useCallback(
@@ -345,8 +387,15 @@ export const useP2PChat = (currentUser: User) => {
           attachment: persisted.attachment ?? null
         }
       ]);
+      setPartnerLastMessageById((prev) => ({
+        ...prev,
+        [selectedPartner.id]: {
+          text: makePreviewText({ body: persisted.body, attachment: persisted.attachment ?? null }),
+          sentAt: persisted.sentAt
+        }
+      }));
     },
-    [selectedPartner]
+    [makePreviewText, selectedPartner]
   );
 
   const canSend = useMemo(() => selectedPartner !== null, [selectedPartner]);
@@ -371,6 +420,7 @@ export const useP2PChat = (currentUser: User) => {
     sendMessage,
     sendAttachment,
     messages,
+    partnerLastMessageById,
     canSend,
     status,
     signalStatus,
