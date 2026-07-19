@@ -160,6 +160,13 @@ export const conversationsRepo = {
   }
 };
 
+type MessageWithAttachment = MessageRecord & {
+  attachment_id: number | null;
+  attachment_original_name: string | null;
+  attachment_mime_type: string | null;
+  attachment_size_bytes: number | null;
+};
+
 export const messagesRepo = {
   createMessage(conversationId: number, senderId: number, body: string, sentAt?: string): MessageRecord {
     const effectiveSentAt = sentAt ?? new Date().toISOString();
@@ -169,6 +176,50 @@ export const messagesRepo = {
        RETURNING id, conversation_id, sender_id, body, sent_at`
     );
     return stmt.get(conversationId, senderId, body, effectiveSentAt) as MessageRecord;
+  },
+
+  getMessagesPage(
+    conversationId: number,
+    beforeId: number | null,
+    limit = 50
+  ): { messages: MessageWithAttachment[]; hasMore: boolean } {
+    const baseQuery = `SELECT
+         m.id,
+         m.conversation_id,
+         m.sender_id,
+         m.body,
+         m.sent_at,
+         a.id AS attachment_id,
+         a.original_name AS attachment_original_name,
+         a.mime_type AS attachment_mime_type,
+         a.size_bytes AS attachment_size_bytes
+       FROM messages m
+       LEFT JOIN attachments a ON a.message_id = m.id
+       WHERE conversation_id = ?`;
+
+    const stmt =
+      beforeId === null
+        ? db.prepare(
+            `${baseQuery}
+       ORDER BY m.id DESC
+       LIMIT ?`
+          )
+        : db.prepare(
+            `${baseQuery}
+         AND m.id < ?
+       ORDER BY m.id DESC
+       LIMIT ?`
+          );
+    const rawRows =
+      beforeId === null
+        ? (stmt.all(conversationId, limit + 1) as MessageWithAttachment[])
+        : (stmt.all(conversationId, beforeId, limit + 1) as MessageWithAttachment[]);
+    const hasMore = rawRows.length > limit;
+    const pageRows = hasMore ? rawRows.slice(0, limit) : rawRows;
+    return {
+      messages: pageRows.reverse(),
+      hasMore
+    };
   },
 
   getRecentMessages(
@@ -182,32 +233,7 @@ export const messagesRepo = {
       attachment_size_bytes: number | null;
     }
   > {
-    const stmt = db.prepare(
-      `SELECT
-         m.id,
-         m.conversation_id,
-         m.sender_id,
-         m.body,
-         m.sent_at,
-         a.id AS attachment_id,
-         a.original_name AS attachment_original_name,
-         a.mime_type AS attachment_mime_type,
-         a.size_bytes AS attachment_size_bytes
-       FROM messages m
-       LEFT JOIN attachments a ON a.message_id = m.id
-       WHERE conversation_id = ?
-       ORDER BY m.sent_at DESC
-       LIMIT ?`
-    );
-    const rows = stmt.all(conversationId, limit) as Array<
-      MessageRecord & {
-        attachment_id: number | null;
-        attachment_original_name: string | null;
-        attachment_mime_type: string | null;
-        attachment_size_bytes: number | null;
-      }
-    >;
-    return rows.reverse();
+    return this.getMessagesPage(conversationId, null, limit).messages;
   }
 };
 

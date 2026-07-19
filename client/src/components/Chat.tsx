@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type KeyboardEvent } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ChangeEvent, type KeyboardEvent } from "react";
 import { ArrowLeft, Circle, Download, LogOut, Paperclip } from "lucide-react";
 import type { User } from "../lib/api";
 import { downloadAttachment, logout } from "../lib/api";
@@ -15,6 +15,7 @@ type Props = {
 
 const MIN_COMPOSER_HEIGHT = 52;
 const MAX_COMPOSER_HEIGHT = 220;
+const MESSAGE_GROUP_WINDOW_MS = 3 * 60 * 1000;
 
 export const Chat = ({ currentUser, onLoggedOut }: Props) => {
   const {
@@ -26,6 +27,10 @@ export const Chat = ({ currentUser, onLoggedOut }: Props) => {
     sendAttachment,
     messages,
     partnerLastMessageById,
+    loadOlderMessages,
+    hasMoreOlder,
+    loadingOlder,
+    loadingHistory,
     canSend
   } = useP2PChat(currentUser);
   const [draft, setDraft] = useState("");
@@ -34,13 +39,49 @@ export const Chat = ({ currentUser, onLoggedOut }: Props) => {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const messageBoxRef = useRef<HTMLTextAreaElement | null>(null);
   const messagesScrollRootRef = useRef<HTMLDivElement | null>(null);
+  const messagesTopRef = useRef<HTMLDivElement | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const shouldAutoScrollRef = useRef(true);
+  const loadingOlderRef = useRef(false);
+  const pendingPrependScrollRef = useRef<{ firstMessageId?: string; scrollHeight: number; scrollTop: number } | null>(null);
+  const pendingInitialAnchorPartnerIdRef = useRef<number | null>(null);
   const [hasUnreadBelow, setHasUnreadBelow] = useState(false);
   const sortedMessages = useMemo(
     () => [...messages].sort((a, b) => a.sentAt.localeCompare(b.sentAt)),
     [messages]
   );
+  const groupedMessages = useMemo(() => {
+    const groups: Array<{
+      key: string;
+      senderId: number;
+      startedAt: string;
+      items: typeof sortedMessages;
+    }> = [];
+
+    for (const message of sortedMessages) {
+      const previousGroup = groups[groups.length - 1];
+      const previousMessage = previousGroup?.items[previousGroup.items.length - 1];
+      const canAppend =
+        previousGroup &&
+        previousMessage &&
+        previousGroup.senderId === message.senderId &&
+        new Date(message.sentAt).getTime() - new Date(previousMessage.sentAt).getTime() <= MESSAGE_GROUP_WINDOW_MS;
+
+      if (canAppend) {
+        previousGroup.items.push(message);
+        continue;
+      }
+
+      groups.push({
+        key: message.id,
+        senderId: message.senderId,
+        startedAt: message.sentAt,
+        items: [message]
+      });
+    }
+
+    return groups;
+  }, [sortedMessages]);
   const onlineSet = useMemo(() => new Set(onlineUserIds), [onlineUserIds]);
 
   const resizeDraftBox = useCallback(() => {
@@ -92,16 +133,6 @@ export const Chat = ({ currentUser, onLoggedOut }: Props) => {
     return `${(sizeBytes / (1024 * 1024)).toFixed(1)} MB`;
   };
 
-  const formatMessageTimestamp = (isoDate: string): string =>
-    new Date(isoDate).toLocaleString("vi-VN", {
-      day: "2-digit",
-      month: "2-digit",
-      year: "numeric",
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit"
-    });
-
   const formatCompactDateTime = (isoDate: string): string =>
     new Date(isoDate).toLocaleString("vi-VN", {
       day: "2-digit",
@@ -141,6 +172,10 @@ export const Chat = ({ currentUser, onLoggedOut }: Props) => {
   }, [draft, resizeDraftBox]);
 
   useEffect(() => {
+    loadingOlderRef.current = loadingOlder;
+  }, [loadingOlder]);
+
+  useEffect(() => {
     const viewport = getMessagesViewport();
     if (!viewport) {
       return;
@@ -164,17 +199,88 @@ export const Chat = ({ currentUser, onLoggedOut }: Props) => {
   useEffect(() => {
     shouldAutoScrollRef.current = true;
     setHasUnreadBelow(false);
-    requestAnimationFrame(() => {
-      scrollMessagesToBottom("auto");
-    });
-  }, [selectedPartner?.id, scrollMessagesToBottom]);
+    pendingPrependScrollRef.current = null;
+    pendingInitialAnchorPartnerIdRef.current = selectedPartner?.id ?? null;
+  }, [selectedPartner?.id]);
 
   useEffect(() => {
-    if (!selectedPartner) {
+    const viewport = getMessagesViewport();
+    const topMarker = messagesTopRef.current;
+    if (!viewport || !topMarker || !selectedPartner) {
+      return;
+    }
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const entry = entries[0];
+        if (
+          !entry?.isIntersecting ||
+          loadingOlderRef.current ||
+          loadingHistory ||
+          !hasMoreOlder ||
+          !sortedMessages[0]?.id.startsWith("db-")
+        ) {
+          return;
+        }
+
+        pendingPrependScrollRef.current = {
+          firstMessageId: sortedMessages[0]?.id,
+          scrollHeight: viewport.scrollHeight,
+          scrollTop: viewport.scrollTop
+        };
+        void loadOlderMessages();
+      },
+      {
+        root: viewport,
+        rootMargin: "120px 0px 0px 0px",
+        threshold: 0
+      }
+    );
+
+    observer.observe(topMarker);
+    return () => {
+      observer.disconnect();
+    };
+  }, [getMessagesViewport, hasMoreOlder, loadOlderMessages, loadingHistory, selectedPartner, sortedMessages]);
+
+  useLayoutEffect(() => {
+    const viewport = getMessagesViewport();
+    if (!viewport) {
+      return;
+    }
+
+    if (pendingPrependScrollRef.current) {
+      const snapshot = pendingPrependScrollRef.current;
+      if (snapshot.firstMessageId && sortedMessages[0]?.id !== snapshot.firstMessageId) {
+        viewport.scrollTop = viewport.scrollHeight - snapshot.scrollHeight + snapshot.scrollTop;
+        pendingPrependScrollRef.current = null;
+        return;
+      }
+      if (!loadingOlder) {
+        pendingPrependScrollRef.current = null;
+      }
+      return;
+    }
+
+    if (
+      selectedPartner &&
+      pendingInitialAnchorPartnerIdRef.current === selectedPartner.id &&
+      !loadingHistory
+    ) {
+      viewport.scrollTop = viewport.scrollHeight;
+      pendingInitialAnchorPartnerIdRef.current = null;
+    }
+  }, [getMessagesViewport, loadingHistory, loadingOlder, selectedPartner, sortedMessages]);
+
+  useEffect(() => {
+    if (!selectedPartner || loadingHistory || loadingOlder || pendingPrependScrollRef.current) {
       return;
     }
     const lastMessage = sortedMessages[sortedMessages.length - 1];
     if (!lastMessage) {
+      return;
+    }
+    if (pendingInitialAnchorPartnerIdRef.current === selectedPartner.id) {
       return;
     }
 
@@ -187,7 +293,7 @@ export const Chat = ({ currentUser, onLoggedOut }: Props) => {
     }
 
     setHasUnreadBelow(true);
-  }, [currentUser.id, selectedPartner, sortedMessages, scrollMessagesToBottom]);
+  }, [currentUser.id, loadingHistory, loadingOlder, selectedPartner, sortedMessages, scrollMessagesToBottom]);
 
   const onSelectPartner = async (user: User): Promise<void> => {
     await selectPartnerAndConnect(user);
@@ -207,13 +313,15 @@ export const Chat = ({ currentUser, onLoggedOut }: Props) => {
   const isMobileChatView = !showUsersPanel;
   const selectedPartnerOnline = selectedPartner ? onlineSet.has(selectedPartner.id) : false;
   const shellClassName = isMobileChatView
-    ? "mx-auto flex h-[100dvh] max-h-[100dvh] w-full max-w-none flex-col overflow-hidden border-0 bg-card/50 p-0 shadow-none md:h-[80vh] md:max-h-[80vh] md:max-w-6xl md:rounded-2xl md:border md:p-3 md:shadow-sm"
-    : "mx-auto flex h-[calc(100dvh-1rem)] max-h-[calc(100dvh-1rem)] w-full max-w-6xl flex-col overflow-hidden rounded-2xl border bg-card/50 p-2 shadow-sm md:h-[80vh] md:max-h-[80vh] md:p-3";
+    ? "mx-auto flex h-[100dvh] max-h-[100dvh] w-full max-w-none flex-col overflow-hidden border-0 bg-card/50 p-0 shadow-none md:max-w-6xl md:px-3 md:py-3"
+    : "mx-auto flex h-[100dvh] max-h-[100dvh] w-full max-w-6xl flex-col overflow-hidden bg-card/50 px-2 py-2 md:px-3 md:py-3";
 
   return (
-    <main className={`${isMobileChatView ? "w-full py-0" : "container py-2"} md:py-4`}>
+    <main className="w-full py-0 md:h-[100dvh]">
       <div className={shellClassName}>
-        <div className={`${isMobileChatView ? "hidden md:flex" : "flex"} mb-3 items-center justify-end gap-3 rounded-xl bg-gradient-to-r from-primary/10 to-accent/10 p-3 sm:justify-between`}>
+        <div
+          className={`${isMobileChatView ? "hidden md:flex" : "flex"} mb-2 items-center justify-end gap-3 rounded-xl bg-gradient-to-r from-primary/10 to-accent/10 p-2.5 sm:justify-between`}
+        >
           <div className="hidden md:block">
             <h2 className="text-lg font-semibold">Xin chào, {currentUser.username}</h2>
             <p className="text-sm text-muted-foreground">
@@ -235,7 +343,7 @@ export const Chat = ({ currentUser, onLoggedOut }: Props) => {
           </div>
         </div>
 
-        <div className="flex min-h-0 flex-1 flex-col gap-3 md:grid md:grid-cols-[300px_1fr]">
+        <div className="flex min-h-0 flex-1 flex-col gap-2 md:grid md:grid-cols-[300px_1fr]">
           <Card className={`${showUsersPanel ? "flex" : "hidden"} min-h-0 flex-1 flex-col md:flex`}>
             <CardHeader className="pb-3">
               <CardTitle className="text-base">Người dùng</CardTitle>
@@ -282,7 +390,7 @@ export const Chat = ({ currentUser, onLoggedOut }: Props) => {
           </Card>
 
           <Card className={`${showUsersPanel ? "hidden md:flex" : "flex"} min-h-0 flex-1 flex-col overflow-hidden rounded-none border-x-0 md:rounded-xl md:border-x`}>
-            <CardHeader className="sticky top-0 z-10 border-b bg-card/95 pb-3 backdrop-blur supports-[backdrop-filter]:bg-card/80">
+            <CardHeader className="sticky top-0 z-10 border-b bg-card/95 pb-2.5 pt-4 backdrop-blur supports-[backdrop-filter]:bg-card/80">
               <div className="flex items-center gap-2">
                 <Button
                   variant="ghost"
@@ -306,39 +414,61 @@ export const Chat = ({ currentUser, onLoggedOut }: Props) => {
               </div>
             </CardHeader>
             <CardContent className="relative flex min-h-0 flex-1 flex-col gap-0 p-0">
-              <ScrollArea ref={messagesScrollRootRef} className="min-h-0 flex-1 bg-background/70 p-3">
-                <div className="grid gap-3">
-                  {sortedMessages.map((m) => (
-                    <div key={m.id} className="rounded-md border bg-background/60 p-3 text-sm leading-relaxed">
-                      <strong>{m.senderId === currentUser.id ? "Bạn" : selectedPartner?.username ?? "Đối phương"}:</strong>{" "}
-                      {m.attachment ? (
-                        <span className="inline-flex flex-wrap items-center gap-2">
-                          <span>{m.attachment.originalName}</span>
-                          <span className="text-xs text-muted-foreground">({formatFileSize(m.attachment.sizeBytes)})</span>
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            className="h-8 px-2.5 text-xs"
-                            onClick={() => {
-                              void downloadAttachment(m.attachment!).catch(() => {
-                                // Errors are intentionally not surfaced in UI.
-                              });
-                            }}
-                          >
-                            <Download className="h-3.5 w-3.5" />
-                            Tải xuống
-                          </Button>
-                        </span>
-                      ) : (
-                        <span className="whitespace-pre-wrap break-words">{m.body}</span>
-                      )}
-                      <span className="mt-1.5 block text-xs text-muted-foreground">
-                        {formatMessageTimestamp(m.sentAt)} {m.persisted ? "" : "(đang đồng bộ...)"}
-                      </span>
-                    </div>
-                  ))}
-                  {sortedMessages.length === 0 && (
-                    <p className="text-sm text-muted-foreground">Chưa có tin nhắn nào trong cuộc trò chuyện này.</p>
+              <ScrollArea ref={messagesScrollRootRef} className="min-h-0 flex-1 bg-background/70 p-2.5">
+                <div className="flex flex-col">
+                  <div ref={messagesTopRef} className="h-px" />
+                  {loadingOlder && (
+                    <div className="pb-2 text-center text-xs text-muted-foreground">Đang tải tin nhắn cũ hơn...</div>
+                  )}
+                  {groupedMessages.map((group) => {
+                    const senderLabel = group.senderId === currentUser.id ? "Bạn" : selectedPartner?.username ?? "Đối phương";
+                    return (
+                      <div key={group.key} className="mt-2 first:mt-0">
+                        <div className="mb-0.5 flex items-center gap-2 text-[11px] font-medium text-muted-foreground">
+                          <span>{senderLabel}</span>
+                          <span>{formatCompactDateTime(group.startedAt)}</span>
+                          <span className="h-px min-w-6 flex-1 bg-border/80" />
+                        </div>
+                        <div className="flex flex-col">
+                          {group.items.map((message, index) => (
+                            <div
+                              key={message.id}
+                              className={`px-1 py-0.5 text-sm leading-snug ${index === 0 ? "" : "pl-4"}`}
+                            >
+                              {message.attachment ? (
+                                <span className="inline-flex flex-wrap items-center gap-1.5">
+                                  <span className="break-all">{message.attachment.originalName}</span>
+                                  <span className="text-[11px] text-muted-foreground">
+                                    ({formatFileSize(message.attachment.sizeBytes)})
+                                  </span>
+                                  <Button
+                                    variant="outline"
+                                    size="sm"
+                                    className="h-7 px-2 text-xs"
+                                    onClick={() => {
+                                      void downloadAttachment(message.attachment!).catch(() => {
+                                        // Errors are intentionally not surfaced in UI.
+                                      });
+                                    }}
+                                  >
+                                    <Download className="h-3.5 w-3.5" />
+                                    Tải xuống
+                                  </Button>
+                                </span>
+                              ) : (
+                                <span className="whitespace-pre-wrap break-words">{message.body}</span>
+                              )}
+                              {!message.persisted && (
+                                <span className="ml-2 text-[11px] text-muted-foreground">(đang đồng bộ...)</span>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })}
+                  {!loadingHistory && sortedMessages.length === 0 && (
+                    <p className="py-2 text-sm text-muted-foreground">Chưa có tin nhắn nào trong cuộc trò chuyện này.</p>
                   )}
                   <div ref={messagesEndRef} />
                 </div>

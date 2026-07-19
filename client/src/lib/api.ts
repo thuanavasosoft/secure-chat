@@ -19,6 +19,12 @@ export type AttachmentMeta = {
   sizeBytes: number;
 };
 
+export type HistoryResponse = {
+  conversationId: number | null;
+  messages: ChatMessage[];
+  hasMore: boolean;
+};
+
 const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8080";
 
 const VI_ERROR_MAP: Record<string, string> = {
@@ -111,10 +117,18 @@ export const getUsers = async (): Promise<User[]> => {
   return data.users;
 };
 
-export const getHistory = async (partnerUserId: number): Promise<{ conversationId: number | null; messages: ChatMessage[] }> => {
-  return request<{ conversationId: number | null; messages: ChatMessage[] }>(
-    `/api/history?partnerUserId=${partnerUserId}`
-  );
+export const getHistory = async (
+  partnerUserId: number,
+  opts?: { before?: number; limit?: number }
+): Promise<HistoryResponse> => {
+  const params = new URLSearchParams({ partnerUserId: String(partnerUserId) });
+  if (opts?.before !== undefined) {
+    params.set("before", String(opts.before));
+  }
+  if (opts?.limit !== undefined) {
+    params.set("limit", String(opts.limit));
+  }
+  return request<HistoryResponse>(`/api/history?${params.toString()}`);
 };
 
 export const persistOutgoingMessage = async (

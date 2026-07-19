@@ -26,6 +26,19 @@ type PartnerLastMessage = {
 
 type ConnectionStatus = "idle" | "signaling" | "connecting" | "open" | "closed" | "error";
 
+const HISTORY_PAGE_SIZE = 50;
+
+const parseDbMessageId = (messageId: string | undefined): number | null => {
+  if (!messageId) {
+    return null;
+  }
+  const match = /^db-(\d+)$/.exec(messageId);
+  if (!match) {
+    return null;
+  }
+  return Number.parseInt(match[1], 10);
+};
+
 export const useP2PChat = (currentUser: User) => {
   const signalingRef = useRef<SignalingClient | null>(null);
   const peerRef = useRef<WebRtcDataPeer | null>(null);
@@ -40,6 +53,9 @@ export const useP2PChat = (currentUser: User) => {
   const [iceState, setIceState] = useState<RTCPeerConnectionState>("new");
   const [error, setError] = useState<string | null>(null);
   const [partnerLastMessageById, setPartnerLastMessageById] = useState<Record<number, PartnerLastMessage>>({});
+  const [hasMoreOlder, setHasMoreOlder] = useState(false);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const [loadingHistory, setLoadingHistory] = useState(false);
 
   const makePreviewText = useCallback((message: { body: string; attachment: AttachmentMeta | null }): string => {
     if (message.attachment) {
@@ -215,38 +231,77 @@ export const useP2PChat = (currentUser: User) => {
       );
   }, []);
 
-  const loadHistory = useCallback(async (partner: User) => {
-    const data = await getHistory(partner.id);
-    const mappedMessages = data.messages.map((m: ChatMessage) => ({
+  const mapHistoryMessages = useCallback(
+    (historyMessages: ChatMessage[]): UiMessage[] =>
+      historyMessages.map((m) => ({
         id: `db-${m.id}`,
         senderId: m.senderId,
         body: m.body,
         sentAt: m.sentAt,
         persisted: true,
         attachment: m.attachment ?? null
-      }));
-    setMessages(mappedMessages);
+      })),
+    []
+  );
 
-    const latestMessage = mappedMessages[mappedMessages.length - 1];
-    setPartnerLastMessageById((prev) => {
-      if (!latestMessage) {
-        return prev;
-      }
-      return {
-        ...prev,
-        [partner.id]: {
-          text: makePreviewText({ body: latestMessage.body, attachment: latestMessage.attachment }),
-          sentAt: latestMessage.sentAt
+  const oldestLoadedId = useMemo(() => parseDbMessageId(messages[0]?.id), [messages]);
+
+  const loadHistory = useCallback(async (partner: User) => {
+    try {
+      const data = await getHistory(partner.id, { limit: HISTORY_PAGE_SIZE });
+      const mappedMessages = mapHistoryMessages(data.messages);
+      setMessages(mappedMessages);
+      setHasMoreOlder(data.hasMore);
+      setLoadingOlder(false);
+
+      const latestMessage = mappedMessages[mappedMessages.length - 1];
+      setPartnerLastMessageById((prev) => {
+        if (!latestMessage) {
+          return prev;
         }
-      };
-    });
-  }, [makePreviewText]);
+        return {
+          ...prev,
+          [partner.id]: {
+            text: makePreviewText({ body: latestMessage.body, attachment: latestMessage.attachment }),
+            sentAt: latestMessage.sentAt
+          }
+        };
+      });
+    } finally {
+      setLoadingHistory(false);
+    }
+  }, [makePreviewText, mapHistoryMessages]);
+
+  const loadOlderMessages = useCallback(async () => {
+    if (!selectedPartner || !oldestLoadedId || !hasMoreOlder || loadingOlder) {
+      return;
+    }
+
+    setLoadingOlder(true);
+    try {
+      const data = await getHistory(selectedPartner.id, {
+        before: oldestLoadedId,
+        limit: HISTORY_PAGE_SIZE
+      });
+      const olderMessages = mapHistoryMessages(data.messages);
+      setMessages((prev) => [...olderMessages, ...prev]);
+      setHasMoreOlder(data.hasMore);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? translateErrorMessageVi(err.message) : "Không thể tải lịch sử cũ hơn.");
+    } finally {
+      setLoadingOlder(false);
+    }
+  }, [hasMoreOlder, loadingOlder, mapHistoryMessages, oldestLoadedId, selectedPartner]);
 
   const selectPartner = useCallback(
     async (partner: User) => {
       setSelectedPartner(partner);
       setStatus("idle");
       setError(null);
+      setLoadingHistory(true);
+      setHasMoreOlder(false);
+      setLoadingOlder(false);
+      setMessages([]);
       peerRef.current?.close();
       peerRef.current = null;
       await loadHistory(partner);
@@ -421,6 +476,10 @@ export const useP2PChat = (currentUser: User) => {
     sendAttachment,
     messages,
     partnerLastMessageById,
+    loadOlderMessages,
+    hasMoreOlder,
+    loadingOlder,
+    loadingHistory,
     canSend,
     status,
     signalStatus,

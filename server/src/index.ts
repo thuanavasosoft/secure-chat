@@ -14,6 +14,7 @@ import { createRestRateLimit } from "./rateLimit";
 import type { AuthenticatedRequest } from "./types";
 import {
   isUploadFileAllowed,
+  validateHistoryQuery,
   validatePartnerUserIdQuery,
   validatePartnerUserIdRaw,
   validatePersistMessageBody
@@ -41,6 +42,11 @@ const upload = multer({
     files: 1,
     fileSize: MAX_UPLOAD_FILE_SIZE_BYTES
   },
+  // Browsers send multipart filename parameters as UTF-8 bytes; multer/busboy
+  // otherwise decodes them as latin1, which mangles non-ASCII names (e.g. Vietnamese).
+  // The `defParamCharset` option is supported by multer 2.x at runtime but is missing
+  // from @types/multer, so cast to keep typings happy.
+  ...({ defParamCharset: "utf8" } as Record<string, unknown>),
   fileFilter: (_req, file, cb) => {
     if (isUploadFileAllowed(file.originalname, file.mimetype)) {
       cb(null, true);
@@ -80,11 +86,12 @@ app.get("/api/users", requireAuth, (req: AuthenticatedRequest, res) => {
 });
 
 app.get("/api/history", requireAuth, (req: AuthenticatedRequest, res) => {
-  const partnerUserId = validatePartnerUserIdQuery(req.query.partnerUserId);
-  if (!partnerUserId) {
+  const parsedQuery = validateHistoryQuery(req.query as Record<string, unknown>);
+  if (!parsedQuery) {
     res.status(400).json({ error: "Invalid partnerUserId" });
     return;
   }
+  const { partnerUserId, before, limit } = parsedQuery;
   const partner = usersRepo.findById(partnerUserId);
   if (!partner) {
     res.status(404).json({ error: "Partner user not found" });
@@ -92,12 +99,13 @@ app.get("/api/history", requireAuth, (req: AuthenticatedRequest, res) => {
   }
   const conversation = conversationsRepo.findConversation(req.user!.id, partnerUserId);
   if (!conversation) {
-    res.json({ conversationId: null, messages: [] });
+    res.json({ conversationId: null, messages: [], hasMore: false });
     return;
   }
-  const messages = messagesRepo.getRecentMessages(conversation.id, 200);
+  const { messages, hasMore } = messagesRepo.getMessagesPage(conversation.id, before ?? null, limit);
   res.json({
     conversationId: conversation.id,
+    hasMore,
     messages: messages.map((m) => ({
       id: m.id,
       senderId: m.sender_id,

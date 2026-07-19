@@ -56,6 +56,43 @@ export const validatePartnerUserIdRaw = (partnerUserIdRaw: unknown): number | nu
   return isPositiveInt(parsed) ? parsed : null;
 };
 
+export const validateHistoryQuery = (
+  query: Record<string, unknown>
+): { partnerUserId: number; before?: number; limit: number } | null => {
+  const partnerUserId = validatePartnerUserIdQuery(query.partnerUserId);
+  if (!partnerUserId) {
+    return null;
+  }
+
+  const beforeRaw = query.before;
+  let before: number | undefined;
+  if (beforeRaw !== undefined) {
+    if (typeof beforeRaw !== "string") {
+      return null;
+    }
+    const parsedBefore = Number.parseInt(beforeRaw, 10);
+    if (!isPositiveInt(parsedBefore)) {
+      return null;
+    }
+    before = parsedBefore;
+  }
+
+  const limitRaw = query.limit;
+  let limit = 50;
+  if (limitRaw !== undefined) {
+    if (typeof limitRaw !== "string") {
+      return null;
+    }
+    const parsedLimit = Number.parseInt(limitRaw, 10);
+    if (!isPositiveInt(parsedLimit) || parsedLimit > 100) {
+      return null;
+    }
+    limit = parsedLimit;
+  }
+
+  return { partnerUserId, before, limit };
+};
+
 export const isUploadFileAllowed = (filename: string, mimeType: string): boolean => {
   const normalizedName = filename.trim().toLowerCase();
   const extension = normalizedName.includes(".") ? normalizedName.slice(normalizedName.lastIndexOf(".")) : "";
